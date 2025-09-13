@@ -1,0 +1,385 @@
+name: Note Pipeline (note.com)
+
+on:
+  workflow_dispatch:
+    inputs:
+      theme:
+        description: '記事テーマ'
+        required: true
+        type: string
+      target:
+        description: '想定読者（ペルソナ）'
+        required: true
+        type: string
+      message:
+        description: '読者に伝えたい核メッセージ'
+        required: true
+        type: string
+      cta:
+        description: '読後のアクション（CTA）'
+        required: true
+        type: string
+      tags:
+        description: 'カンマ区切りタグ（任意）'
+        required: false
+        default: ''
+        type: string
+      is_public:
+        description: '公開(true)/下書き(false)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      dry_run:
+        description: '投稿をスキップ（生成のみ）'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Tokyo
+
+jobs:
+  generate:
+    name: Generate (Research → Write → Fact-check)
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      THEME: ${{ github.event.inputs.theme }}
+      TARGET: ${{ github.event.inputs.target }}
+      MESSAGE: ${{ github.event.inputs.message }}
+      CTA: ${{ github.event.inputs.cta }}
+      INPUT_TAGS: ${{ github.event.inputs.tags }}
+    outputs:
+      title: ${{ steps.collect.outputs.title }}
+      body: ${{ steps.collect.outputs.body }}
+      tags: ${{ steps.collect.outputs.tags }}
+    steps:
+      - name: Checkout (self)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies (Claude Code SDK, AI SDK)
+        run: |
+          npm init -y
+          npm i @anthropic-ai/claude-code ai @ai-sdk/anthropic zod
+
+      - name: Run pipeline (research/write/fact-check)
+        id: run_pipeline
+        run: |
+          cat > generate.mjs <<'EOF'
+          import { query } from '@anthropic-ai/claude-code';
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
+          import fs from 'fs';
+
+          const modelName = 'claude-sonnet-4-20250514';
+
+          function getEnv(name, def='') { const v = process.env[name]; return (v ?? def).toString(); }
+
+          const theme = getEnv('THEME');
+          const target = getEnv('TARGET');
+          const message = getEnv('MESSAGE');
+          const cta = getEnv('CTA');
+          const inputTags = getEnv('INPUT_TAGS');
+
+          const ensure = (cond, msg) => { if (!cond) { throw new Error(msg); } };
+          ensure(!!process.env.ANTHROPIC_API_KEY, 'ANTHROPIC_API_KEY is required');
+
+          const artifactsDir = '.note-artifacts';
+          fs.mkdirSync(artifactsDir, { recursive: true });
+
+          async function runResearch() {
+            const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
+
+            const messages = [];
+            for await (const msg of query({
+              prompt: userPrompt,
+              options: {
+                allowedTools: ['WebSearch','WebFetch'],
+                permissionMode: 'acceptEdits',
+              },
+            })) {
+              messages.push(msg);
+            }
+            const assistantTexts = messages
+              .filter(m => m.type === 'assistant')
+              .map(m => {
+                const content = m.message?.content;
+                if (Array.isArray(content)) {
+                  return content.filter(b => b?.type === 'text').map(b => b.text).join('\n');
+                }
+                return '';
+              })
+              .filter(Boolean)
+              .join('\n\n');
+            const researchReport = assistantTexts || 'リサーチ結果の生成に失敗しました。後続で再試行してください。';
+            fs.writeFileSync(`${artifactsDir}/research.md`, researchReport);
+            return researchReport;
+          }
+
+          function extractJsonFlexible(raw) {
+            const trimmed = (raw || '').trim().replace(/\u200B/g, '');
+            try { return JSON.parse(trimmed); } catch {}
+            const fence = trimmed.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);
+            if (fence && fence[1]) { try { return JSON.parse(fence[1].trim()); } catch {} }
+            const first = trimmed.indexOf('{');
+            const last = trimmed.lastIndexOf('}');
+            if (first !== -1 && last !== -1 && last > first) {
+              const candidate = trimmed.slice(first, last + 1);
+              try { return JSON.parse(candidate); } catch {}
+            }
+            return null;
+          }
+
+          async function runWrite(researchReport) {
+            const prompt = `以下の変数を用いて note 記事を生成し、必ずJSONで {title, draftBody, tags[]} を返してください。本文はMarkdown可。\n出力はJSONオブジェクトのみ。先頭や末尾に説明文・コードフェンス・バックティックは一切付けないでください。\n{テーマ}: ${theme}\n{ペルソナ}: ${target}\n{リサーチ内容}: ${researchReport}\n{伝えたいこと}: ${message}\n{読後のアクション}: ${cta}`;
+            const { text } = await generateText({ model: anthropic(modelName), prompt, temperature: 0.7, maxTokens: 10000 });
+            let obj = extractJsonFlexible(text || '');
+            let title, draftBody, tags;
+            if (obj && typeof obj === 'object') {
+              title = String(obj.title ?? '').trim();
+              draftBody = String(obj.draftBody ?? '').trim();
+              tags = Array.isArray(obj.tags) ? obj.tags.map(String) : [];
+            }
+            if (!title || !draftBody) {
+              const fallback = (text || '').split(/\r?\n/);
+              title = (fallback[0] || 'タイトル（自動生成）').trim();
+              draftBody = fallback.slice(1).join('\n').trim() || text || '';
+              tags = [];
+            }
+            if (inputTags && inputTags.trim()) {
+              const extra = inputTags.split(',').map(s => s.trim()).filter(Boolean);
+              tags = Array.from(new Set([...(tags || []), ...extra]));
+            }
+            return { title, draftBody, tags };
+          }
+
+          async function runFactCheck(draftBody) {
+            const fcInstr = `あなたは事実検証の専門家です。入力の記事（以下「原稿」）について、事実関係・数値・固有名詞・引用の正確性を確認し、必要に応じて修正します。一次情報や公的情報を優先し、本文中にMarkdownリンクで出典を埋め込み、文体や構成は尊重してください。\n\n最終出力は「レビュー済みの note 記事（全文）」のみを返してください。説明文は不要です。`;
+            const { text } = await generateText({ model: anthropic(modelName), system: fcInstr, prompt: draftBody, temperature: 0.3, maxTokens: 10000 });
+            return (text || '').trim();
+          }
+
+          (async () => {
+            const research = await runResearch();
+            const { title, draftBody, tags } = await runWrite(research);
+            const body = await runFactCheck(draftBody);
+            const draft = `# ${title}\n\n${body}\n`;
+            fs.writeFileSync(`${artifactsDir}/draft.md`, draft);
+            fs.writeFileSync(`${artifactsDir}/draft.json`, JSON.stringify({ title, body, tags }, null, 2));
+            console.log('Generated draft saved to .note-artifacts/');
+          })().catch(e => { console.error(e); process.exit(1); });
+          EOF
+          node generate.mjs
+
+      - name: Upload draft artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: note-draft
+          path: .note-artifacts
+
+      - name: Ensure jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+      - name: Collect outputs
+        id: collect
+        run: |
+          title=$(jq -r .title .note-artifacts/draft.json)
+          body=$(jq -r .body .note-artifacts/draft.json)
+          tags=$(jq -r '.tags | join(", ")' .note-artifacts/draft.json)
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "$title" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$body" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "tags=$tags" >> $GITHUB_OUTPUT
+
+  post:
+    name: Post to note.com (Playwright)
+    needs: generate
+    if: ${{ github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    # 承認ゲート: リポジトリ設定 > Environments で `note-approval` に Required reviewers を設定してください
+    environment: note-approval
+    env:
+      THEME: ${{ github.event.inputs.theme }}
+      IS_PUBLIC: ${{ github.event.inputs.is_public }}
+      STATE_JSON: ${{ secrets.NOTE_STORAGE_STATE_JSON }}
+      START_URL: https://editor.note.com/new
+    steps:
+      - name: Checkout (self)
+        uses: actions/checkout@v4
+
+      - name: Download draft
+        uses: actions/download-artifact@v4
+        with:
+          name: note-draft
+          path: .note-artifacts
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm i playwright
+          npx playwright install --with-deps chromium | cat
+
+      - name: Prepare storageState
+        id: state
+        run: |
+          test -n "$STATE_JSON" || (echo "ERROR: NOTE_STORAGE_STATE_JSON secret is not set" && exit 1)
+          mkdir -p "$RUNNER_TEMP"
+          echo "$STATE_JSON" > "$RUNNER_TEMP/note-state.json"
+          echo "STATE_PATH=$RUNNER_TEMP/note-state.json" >> $GITHUB_OUTPUT
+
+      - name: Publish via Playwright
+        id: publish
+        env:
+          TITLE: ${{ needs.generate.outputs.title }}
+          BODY: ${{ needs.generate.outputs.body }}
+          TAGS: ${{ needs.generate.outputs.tags }}
+          STATE_PATH: ${{ steps.state.outputs.STATE_PATH }}
+        run: |
+          cat > post.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'fs';
+          import os from 'os';
+          import path from 'path';
+
+          function nowStr() {
+            const d = new Date();
+            const z = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}_${z(d.getHours())}-${z(d.getMinutes())}-${z(d.getSeconds())}`;
+          }
+
+          const STATE_PATH = process.env.STATE_PATH;
+          const START_URL = process.env.START_URL || 'https://editor.note.com/new';
+          const TITLE = process.env.TITLE || '';
+          const BODY = process.env.BODY || '';
+          const TAGS = process.env.TAGS || '';
+          const IS_PUBLIC = String(process.env.IS_PUBLIC || 'true') === 'true';
+
+          if (!fs.existsSync(STATE_PATH)) {
+            console.error('storageState not found:', STATE_PATH);
+            process.exit(1);
+          }
+
+          const ssDir = path.join(os.tmpdir(), 'note-screenshots');
+          fs.mkdirSync(ssDir, { recursive: true });
+          const SS_PATH = path.join(ssDir, `note-post-${nowStr()}.png`);
+
+          let browser, context, page;
+          try {
+            browser = await chromium.launch({ headless: true, args: ['--lang=ja-JP'] });
+            context = await browser.newContext({ storageState: STATE_PATH, locale: 'ja-JP' });
+            page = await context.newPage();
+            page.setDefaultTimeout(180000);
+
+            await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
+            await page.waitForSelector('textarea[placeholder*="タイトル"]');
+
+            await page.fill('textarea[placeholder*="タイトル"]', TITLE);
+
+            const bodyBox = page.locator('div[contenteditable="true"][role="textbox"]').first();
+            await bodyBox.waitFor({ state: 'visible' });
+            await bodyBox.click();
+            await page.keyboard.type(BODY);
+
+            if (!IS_PUBLIC) {
+              const saveBtn = page.locator('button:has-text("下書き保存"), [aria-label*="下書き保存"]').first();
+              await saveBtn.waitFor({ state: 'visible' });
+              if (await saveBtn.isEnabled()) {
+                await saveBtn.click();
+                await page.locator('text=保存しました').waitFor({ timeout: 4000 }).catch(() => {});
+              }
+              await page.screenshot({ path: SS_PATH, fullPage: true });
+              console.log('DRAFT_URL=' + page.url());
+              console.log('SCREENSHOT=' + SS_PATH);
+              process.exit(0);
+            }
+
+            const proceed = page.locator('button:has-text("公開に進む")').first();
+            await proceed.waitFor({ state: 'visible' });
+            for (let i=0;i<20;i++){ if (await proceed.isEnabled()) break; await page.waitForTimeout(100); }
+            await proceed.click({ force: true });
+
+            await Promise.race([
+              page.waitForURL(/\/publish/i).catch(() => {}),
+              page.locator('button:has-text("投稿する")').first().waitFor({ state: 'visible' }).catch(() => {}),
+            ]);
+
+            const tags = (TAGS || '').split(/[\n,]/).map(s=>s.trim()).filter(Boolean);
+            if (tags.length) {
+              let tagInput = page.locator('input[placeholder*="ハッシュタグ"]');
+              if (!(await tagInput.count())) tagInput = page.locator('input[role="combobox"]').first();
+              await tagInput.waitFor({ state: 'visible' });
+              for (const t of tags) {
+                await tagInput.click();
+                await tagInput.fill(t);
+                await page.keyboard.press('Enter');
+                await page.waitForTimeout(120);
+              }
+            }
+
+            const publishBtn = page.locator('button:has-text("投稿する")').first();
+            await publishBtn.waitFor({ state: 'visible' });
+            for (let i=0;i<20;i++){ if (await publishBtn.isEnabled()) break; await page.waitForTimeout(100); }
+            await publishBtn.click({ force: true });
+
+            await Promise.race([
+              page.waitForURL(u => !/\/publish/i.test(typeof u === 'string' ? u : u.toString()), { timeout: 20000 }).catch(() => {}),
+              page.locator('text=投稿しました').first().waitFor({ timeout: 8000 }).catch(() => {}),
+              page.waitForTimeout(5000),
+            ]);
+
+            await page.screenshot({ path: SS_PATH, fullPage: true });
+            const finalUrl = page.url();
+            console.log('PUBLISHED_URL=' + finalUrl);
+            console.log('SCREENSHOT=' + SS_PATH);
+          } finally {
+            try { await page?.close(); } catch {}
+            try { await context?.close(); } catch {}
+            try { await browser?.close(); } catch {}
+          }
+          EOF
+          node post.mjs | tee post.log
+          url=$(grep '^PUBLISHED_URL=' post.log | tail -n1 | cut -d'=' -f2-)
+          draft=$(grep '^DRAFT_URL=' post.log | tail -n1 | cut -d'=' -f2-)
+          shot=$(grep '^SCREENSHOT=' post.log | tail -n1 | cut -d'=' -f2-)
+          if [ -n "$url" ]; then echo "published_url=$url" >> $GITHUB_OUTPUT; fi
+          if [ -n "$draft" ]; then echo "draft_url=$draft" >> $GITHUB_OUTPUT; fi
+          if [ -n "$shot" ]; then echo "screenshot=$shot" >> $GITHUB_OUTPUT; fi
+
+      - name: Upload screenshot
+        if: ${{ steps.publish.outputs.screenshot != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: note-screenshot
+          path: ${{ steps.publish.outputs.screenshot }}
+
+    outputs:
+      final_url: ${{ steps.publish.outputs.published_url || steps.publish.outputs.draft_url }}
+
+
