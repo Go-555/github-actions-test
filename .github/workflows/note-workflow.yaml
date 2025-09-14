@@ -136,6 +136,10 @@ jobs:
             .join('\n\n');
           const researchReport = assistantTexts || '';
           fs.writeFileSync(`${artifactsDir}/research.md`, researchReport);
+          // Progress log for debugging
+          console.log('--- RESEARCH PREVIEW START ---');
+          console.log(researchReport.slice(0, 2000));
+          console.log('--- RESEARCH PREVIEW END ---');
           EOF
           node research.mjs
 
@@ -269,9 +273,26 @@ jobs:
             }
             return null;
           }
-          const prompt = `以下の変数を用いて note 記事を生成し、必ずJSONで {title, draftBody, tags[]} を返してください。本文はMarkdown可。\n出力はJSONオブジェクトのみ。先頭や末尾に説明文・コードフェンス・バックティックは一切付けないでください。\n{テーマ}: ${theme}\n{ペルソナ}: ${target}\n{リサーチ内容}: ${researchReport}\n{伝えたいこと}: ${message}\n{読後のアクション}: ${cta}`;
+          async function repairJsonWithLLM(raw) {
+            const sys = 'あなたはJSON整形器です。入力テキストから {"title":string,"draftBody":string,"tags":string[]} だけを含む厳密なJSONを返してください。コードフェンスや説明は禁止。';
+            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt: String(raw), temperature: 0, maxTokens: 8000 });
+            const repaired = extractJsonFlexible(text || '');
+            return repaired;
+          }
+          const prompt = [
+            '以下の変数を用いて note 記事を生成し、必ずJSONで {"title":string, "draftBody":string, "tags":string[]} を返してください。本文はMarkdown可。',
+            '出力はJSONオブジェクトのみ。先頭や末尾に説明文・コードフェンス・バックティックは一切付けないでください。',
+            `{テーマ}: ${theme}`,
+            `{ペルソナ}: ${target}`,
+            `{リサーチ内容}: ${researchReport}`,
+            `{伝えたいこと}: ${message}`,
+            `{読後のアクション}: ${cta}`
+          ].join('\n');
           const { text } = await generateText({ model: anthropic(modelName), system: writeSystem, prompt, temperature: 0.7, maxTokens: 30000 });
           let obj = extractJsonFlexible(text || '');
+          if (!obj) {
+            obj = await repairJsonWithLLM(text || '');
+          }
           let title, draftBody, tags;
           if (obj && typeof obj === 'object') {
             title = String(obj.title ?? '').trim();
