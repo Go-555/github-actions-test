@@ -51,6 +51,7 @@ jobs:
   generate:
     name: Generate (Research → Write → Fact-check)
     runs-on: ubuntu-latest
+    if: ${{ false }}
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
@@ -380,9 +381,198 @@ jobs:
           echo "$final_b64" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+  research:
+    name: Research (CCSDK)
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      THEME: ${{ github.event.inputs.theme }}
+      TARGET: ${{ github.event.inputs.target }}
+    outputs:
+      research_b64: ${{ steps.collect.outputs.research_b64 }}
+    steps:
+      - name: Checkout (self)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies (CCSDK)
+        run: |
+          npm init -y
+          npm i @anthropic-ai/claude-code
+
+      - name: Research with CCSDK
+        run: |
+          cat > research.mjs <<'EOF'
+          import { query } from '@anthropic-ai/claude-code';
+          import fs from 'fs';
+          const theme = process.env.THEME || '';
+          const target = process.env.TARGET || '';
+          const artifactsDir = '.note-artifacts';
+          fs.mkdirSync(artifactsDir, { recursive: true });
+          const sys = [
+            'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
+            '事実ベース・一次情報優先・本文内にMarkdownリンクで出典を埋め込むこと。',
+          ].join('\n');
+          const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
+          const messages = [];
+          for await (const msg of query({
+            prompt: userPrompt,
+            options: {
+              customSystemPrompt: sys,
+              allowedTools: ['WebSearch','WebFetch'],
+              permissionMode: 'acceptEdits',
+            },
+          })) { messages.push(msg); }
+          const assistantTexts = messages.filter(m=>m.type==='assistant').map(m=>{
+            const c=m.message?.content; if(Array.isArray(c)){return c.filter(b=>b?.type==='text').map(b=>b.text).join('\n');} return '';
+          }).filter(Boolean).join('\n\n');
+          fs.writeFileSync(`${artifactsDir}/research.md`, assistantTexts || '');
+          EOF
+          node research.mjs
+
+      - name: Collect research
+        id: collect
+        run: |
+          b64=$(base64 -w 0 .note-artifacts/research.md 2>/dev/null || base64 .note-artifacts/research.md)
+          echo "research_b64<<EOF" >> $GITHUB_OUTPUT
+          echo "$b64" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  write:
+    name: Write (JSON title/body/tags)
+    needs: research
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      THEME: ${{ github.event.inputs.theme }}
+      TARGET: ${{ github.event.inputs.target }}
+      MESSAGE: ${{ github.event.inputs.message }}
+      CTA: ${{ github.event.inputs.cta }}
+      INPUT_TAGS: ${{ github.event.inputs.tags }}
+    outputs:
+      title: ${{ steps.collect.outputs.title }}
+      draft_json_b64: ${{ steps.collect.outputs.draft_json_b64 }}
+    steps:
+      - name: Checkout (self)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps (AI SDK)
+        run: |
+          npm init -y
+          npm i ai @ai-sdk/anthropic
+
+      - name: Restore research
+        env:
+          RESEARCH_B64: ${{ needs.research.outputs.research_b64 }}
+        run: |
+          mkdir -p .note-artifacts
+          echo "$RESEARCH_B64" | base64 -d > .note-artifacts/research.md || echo "$RESEARCH_B64" | base64 --decode > .note-artifacts/research.md
+
+      - name: Write draft
+        run: |
+          cat > write.mjs <<'EOF'
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
+          import fs from 'fs';
+          const theme=process.env.THEME||''; const target=process.env.TARGET||''; const message=process.env.MESSAGE||''; const cta=process.env.CTA||'';
+          const researchReport=fs.readFileSync('.note-artifacts/research.md','utf8');
+          const modelName='claude-sonnet-4-20250514';
+          function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/\u200B/g,'');try{return JSON.parse(t);}catch{}const m=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(m&&m[1]){try{return JSON.parse(m[1].trim());}catch{}}const f=t.indexOf('{'),l=t.lastIndexOf('}');if(f!==-1&&l!==-1&&l>f){const c=t.slice(f,l+1);try{return JSON.parse(c);}catch{}}return null;}
+          async function repairJson(raw){const sys='入力から {"title":string,"draftBody":string,"tags":string[]} のJSONのみ返答。';const {text}=await generateText({model:anthropic(modelName),system:sys,prompt:String(raw),temperature:0,maxTokens:8000});return extractJsonFlexible(text||'');}
+          const sysWrite='note.com向け長文記事の生成。JSON {title,draftBody,tags[]} で返答。';
+          const prompt=[`{テーマ}: ${theme}`,`{ペルソナ}: ${target}`,`{リサーチ内容}: ${researchReport}`,`{伝えたいこと}: ${message}`,`{読後のアクション}: ${cta}`].join('\n');
+          const {text}=await generateText({model:anthropic(modelName),system:sysWrite,prompt,temperature:0.7,maxTokens:30000});
+          let obj=extractJsonFlexible(text||'')||await repairJson(text||'');
+          let title, draftBody, tags; if(obj){title=String(obj.title||'').trim(); draftBody=String(obj.draftBody||'').trim(); tags=Array.isArray(obj.tags)?obj.tags.map(String):[]}
+          if(!title||!draftBody){const lines=(text||'').split(/\r?\n/);title=(lines[0]||'タイトル（自動生成）').trim(); draftBody=lines.slice(1).join('\n').trim()||(text||''); tags=[]}
+          const inputTags=(process.env.INPUT_TAGS||'').split(',').map(s=>s.trim()).filter(Boolean); if(inputTags.length){tags=Array.from(new Set([...(tags||[]),...inputTags]));}
+          fs.writeFileSync('.note-artifacts/draft.json',JSON.stringify({title,draftBody,tags},null,2));
+          EOF
+          node write.mjs
+
+      - name: Collect draft
+        id: collect
+        run: |
+          title=$(jq -r .title .note-artifacts/draft.json)
+          b64=$(base64 -w 0 .note-artifacts/draft.json 2>/dev/null || base64 .note-artifacts/draft.json)
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "$title" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "draft_json_b64<<EOF" >> $GITHUB_OUTPUT
+          echo "$b64" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  factcheck:
+    name: Fact-check
+    needs: write
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TITLE: ${{ needs.write.outputs.title }}
+    outputs:
+      title: ${{ steps.collect.outputs.title }}
+      final_b64: ${{ steps.collect.outputs.final_b64 }}
+    steps:
+      - name: Checkout (self)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps (AI SDK)
+        run: |
+          npm init -y
+          npm i ai @ai-sdk/anthropic
+
+      - name: Restore draft json
+        env:
+          DRAFT_JSON_B64: ${{ needs.write.outputs.draft_json_b64 }}
+        run: |
+          mkdir -p .note-artifacts
+          echo "$DRAFT_JSON_B64" | base64 -d > .note-artifacts/draft.json || echo "$DRAFT_JSON_B64" | base64 --decode > .note-artifacts/draft.json
+
+      - name: Fact-check generate
+        run: |
+          cat > factcheck.mjs <<'EOF'
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
+          import fs from 'fs';
+          const modelName='claude-sonnet-4-20250514';
+          const draft=JSON.parse(fs.readFileSync('.note-artifacts/draft.json','utf8'));
+          const fcSystem='事実検証を行い、本文を修正して全文を返す。本文内に信頼できる出典をMarkdownリンクで埋め込む。出力は最終本文のみ。';
+          const {text}=await generateText({model:anthropic(modelName),system:fcSystem,prompt:String(draft.draftBody||''),temperature:0.3,maxTokens:30000});
+          const body=(text||'').trim();
+          const out={title: process.env.TITLE || draft.title, body, tags: draft.tags||[]};
+          fs.writeFileSync('.note-artifacts/final.json',JSON.stringify(out,null,2));
+          EOF
+          node factcheck.mjs
+
+      - name: Collect final
+        id: collect
+        run: |
+          title=$(jq -r .title .note-artifacts/final.json)
+          b64=$(base64 -w 0 .note-artifacts/final.json 2>/dev/null || base64 .note-artifacts/final.json)
+          echo "title<<EOF" >> $GITHUB_OUTPUT
+          echo "$title" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "final_b64<<EOF" >> $GITHUB_OUTPUT
+          echo "$b64" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
   post:
     name: Post to note.com (Playwright)
-    needs: generate
+    needs: factcheck
     if: ${{ github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     # 承認ゲート: リポジトリ設定 > Environments で `note-approval` に Required reviewers を設定してください
@@ -425,7 +615,7 @@ jobs:
       - name: Restore final from output
         id: draft
         env:
-          FINAL_B64: ${{ needs.generate.outputs.final_b64 }}
+          FINAL_B64: ${{ needs.factcheck.outputs.final_b64 }}
         run: |
           test -n "$FINAL_B64" || { echo "final_b64 output is empty"; exit 1; }
           echo "$FINAL_B64" | base64 -d > final.json || echo "$FINAL_B64" | base64 --decode > final.json
@@ -435,7 +625,7 @@ jobs:
       - name: Publish via Playwright
         id: publish
         env:
-          TITLE: ${{ steps.draft.outputs.TITLE || needs.generate.outputs.title }}
+          TITLE: ${{ steps.draft.outputs.TITLE || needs.factcheck.outputs.title }}
           TAGS: ${{ steps.draft.outputs.TAGS }}
           STATE_PATH: ${{ steps.state.outputs.STATE_PATH }}
         run: |
