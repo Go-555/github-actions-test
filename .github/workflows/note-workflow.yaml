@@ -61,7 +61,7 @@ jobs:
       INPUT_TAGS: ${{ github.event.inputs.tags }}
     outputs:
       title: ${{ steps.collect.outputs.title }}
-      draft_b64: ${{ steps.collect.outputs.draft_b64 }}
+      final_b64: ${{ steps.collect.outputs.final_b64 }}
     steps:
       - name: Checkout (self)
         uses: actions/checkout@v4
@@ -76,60 +76,186 @@ jobs:
           npm init -y
           npm i @anthropic-ai/claude-code ai @ai-sdk/anthropic zod
 
-      - name: Run pipeline (research/write/fact-check)
-        id: run_pipeline
+      - name: Research with CCSDK (Research Agent prompt)
         run: |
-          cat > generate.mjs <<'EOF'
+          cat > research.mjs <<'EOF'
           import { query } from '@anthropic-ai/claude-code';
+          import fs from 'fs';
+          const theme = process.env.THEME || '';
+          const target = process.env.TARGET || '';
+          const artifactsDir = '.note-artifacts';
+          fs.mkdirSync(artifactsDir, { recursive: true });
+          const researchSystemPrompt = `
+    あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。
+    このレポートは後続の「記事執筆」のための素材になります。分量は十分に多く、網羅性と一次情報の裏取りを最優先してください。推論・予測・主観・解釈の上乗せは禁止し、事実ベースのみで構成します。
+
+    — 出力スタイル —
+    - Markdownで構成し、適切な見出しを用いる
+    - 文章量: 最低でも約1,200語以上を目安とし、必要に応じて拡張
+    - 文体: 中立・簡潔・事実ベース。断定ではなく根拠に即した表現
+    - 要点を箇条書きで整理し、重要語を**強調**
+    - 引用は本文中にMarkdownリンクで必ず明示（脚注ではなく文中）
+
+    — 収集ルール —
+    - 調査は必ず ccsdkTool を用いる。一次情報（公式ドキュメント・規格・論文・公的機関・一次データ）を最優先
+    - 二次情報を用いる場合は一次情報への根拠リンクを併記し優先度を下げる
+    - 各ファクトには可能な限り発行日・版数・組織名を併記（例: [W3C, 2024-06-12]）
+    - 引用は短く > 記法で示し、直後に出典リンクを付す
+    - 不確実な情報は「未確認」と明示し、検証先候補を提示
+    - 推測や補完は禁止。曖昧なら記載しない
+
+    — 手順 —
+    1) リサーチ対象・範囲・前提を確認（不足時のみ簡潔に質問）
+    2) ccsdkTool で情報収集→要点抽出。十分な分量になるまで必要に応じて収集を反復
+    3) セクション構成に沿って整理し、各節に出典を本文中で埋め込む
+    4) 最終にリンク切れ・出典不備・主観表現の混入を点検し修正
+          `;
+          const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
+          const messages = [];
+          for await (const msg of query({
+            prompt: userPrompt,
+            options: {
+              customSystemPrompt: researchSystemPrompt,
+              allowedTools: ['WebSearch','WebFetch'],
+              disallowedTools: ['Bash(rm)','Bash(sudo)','Bash(chmod)','Bash(dd)','Bash(format)','Bash(mv)','Bash(cp)'],
+              permissionMode: 'acceptEdits',
+            },
+          })) {
+            messages.push(msg);
+          }
+          const assistantTexts = messages
+            .filter(m => m.type === 'assistant')
+            .map(m => {
+              const content = m.message?.content;
+              if (Array.isArray(content)) {
+                return content.filter(b => b?.type === 'text').map(b => b.text).join('\n');
+              }
+              return '';
+            })
+            .filter(Boolean)
+            .join('\n\n');
+          const researchReport = assistantTexts || '';
+          fs.writeFileSync(`${artifactsDir}/research.md`, researchReport);
+          EOF
+          node research.mjs
+
+      - name: Write draft (Note Write Agent prompt)
+        run: |
+          cat > write.mjs <<'EOF'
           import { generateText } from 'ai';
           import { anthropic } from '@ai-sdk/anthropic';
           import fs from 'fs';
-
+          const theme = process.env.THEME || '';
+          const target = process.env.TARGET || '';
+          const message = process.env.MESSAGE || '';
+          const cta = process.env.CTA || '';
+          const inputTags = (process.env.INPUT_TAGS || '').split(',').map(s=>s.trim()).filter(Boolean);
           const modelName = 'claude-sonnet-4-20250514';
-
-          function getEnv(name, def='') { const v = process.env[name]; return (v ?? def).toString(); }
-
-          const theme = getEnv('THEME');
-          const target = getEnv('TARGET');
-          const message = getEnv('MESSAGE');
-          const cta = getEnv('CTA');
-          const inputTags = getEnv('INPUT_TAGS');
-
-          const ensure = (cond, msg) => { if (!cond) { throw new Error(msg); } };
-          ensure(!!process.env.ANTHROPIC_API_KEY, 'ANTHROPIC_API_KEY is required');
-
           const artifactsDir = '.note-artifacts';
-          fs.mkdirSync(artifactsDir, { recursive: true });
+          const researchReport = fs.readFileSync(`${artifactsDir}/research.md`, 'utf8');
+          const writeSystem = `
+    ## 役割
+    あなたは **note.com** 向けの記事を執筆する超一流のカリスマコピーライターです。
+    ユーザーが提供する5つの変数を活用し、読者に価値ある情報を提供するnote記事を約5000字で執筆してください。
 
-          async function runResearch() {
-            const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
+　　## 入力変数
+    - **{テーマ}**：記事のメインテーマ
+    - **{ペルソナ}**：ターゲット読者
+    - **{リサーチ内容}**：記事作成に必要な調査結果や参考情報
+    - **{伝えたいこと}**：読者の心に残したい核となるメッセージ
+    - **{読後のアクション}**：記事を読み終えた後に取ってもらいたい具体的な行動
 
-            const messages = [];
-            for await (const msg of query({
-              prompt: userPrompt,
-              options: {
-                allowedTools: ['WebSearch','WebFetch'],
-                permissionMode: 'acceptEdits',
-              },
-            })) {
-              messages.push(msg);
-            }
-            const assistantTexts = messages
-              .filter(m => m.type === 'assistant')
-              .map(m => {
-                const content = m.message?.content;
-                if (Array.isArray(content)) {
-                  return content.filter(b => b?.type === 'text').map(b => b.text).join('\n');
-                }
-                return '';
-              })
-              .filter(Boolean)
-              .join('\n\n');
-            const researchReport = assistantTexts || 'リサーチ結果の生成に失敗しました。後続で再試行してください。';
-            fs.writeFileSync(`${artifactsDir}/research.md`, researchReport);
-            return researchReport;
-          }
+    ## note記事内に使用できる挿入ブロック
+    - 画像: 図版/スクショ/ロゴ。キャプションと代替テキストを任意で付与。
+    - 音声: ポッドキャスト/解説音声。タイトル/要約/長さ(目安)を併記。
+    - 埋め込み: YouTube/X/Google Map/Slides等の外部URLを1行で提示。要約を添える。
+    - ファイル: PDF/スライド/サンプルデータ。拡張子・サイズ目安・用途を明記。
+    - 目次: 記事の冒頭直後に配置。
+    - 見出し: h2=大見出し、h3=小見出し。
+    - 箇条書き/番号付きリスト: 手順・要点の整理に使用。
+    - 引用: 重要な発言や出典付きの引用に使用。
+    - コード: フェンス付きコードブロック(言語指定必須)。
+    - 区切り線: セクションの転換点で使用。
+    - 有料エリア指定: 無料部分の続きから開始。購読メリットと目次(有料内)を提示。
 
+    ## 執筆スタイル
+
+    ### 基本姿勢
+    - **親しみやすい専門家**として、一人称「私」を使い、読者と1対1で会話するように執筆
+    - **ポジティブで応援する姿勢**で、難しい話題でも「できそう！」と思えるように、専門用語はわかりやすく解説
+    - **権威性と謙虚さ**のバランスを保ち、{リサーチ内容}で得た信頼性のある情報をベースに自分の経験や失敗談も共有
+
+    ### 文体ルール
+    - **短文中心**（3〜5文の段落）でスマホでも読みやすく
+    - **会話的リズム**で問いかけや比喩を交え、自然なテンポに
+    - **専門用語**は業務文脈に即して噛み砕いて説明
+    - **重要箇所**は**太字**や*斜体*で強調、引用や画像でメリハリを
+
+    ## 記事構成フォーマット
+
+    ### 1. タイトル（12〜20文字）
+    - 最初に必ずタイトルを1行目に出力する
+    - {テーマ}と{ペルソナ}を踏まえて、感情に訴えかけつつも具体的な行動や変化を想起させるタイトルを作成する
+    - 読者の興味を一瞬で引く。数字・質問・強い主張を活用（例：「3つのステップで〜」「知っていますか？」）
+    - 「？」や「〜する方法」など読者の興味を引く要素を入れる
+    - キーワードは具体的に。決まり文句は避け、オリジナリティを優先する
+
+    ### 2. 導入文
+    - 最初の2～3文で心を掴む。共感できる悩みや驚きの事実から入り、「続きを読みたい」と思わせる
+
+    ### 3. 本文
+    - **独自の視点でのストーリーテリング**：「みんなが見ている話題を、自分だけの解像度で語る」よう、各章に具体例やストーリーを必ず含める
+    - **共感＋実用性の両立**：{リサーチ内容}と{伝えたいこと}を基に、読者の疑問に答える形で即行動できる解決策を提示
+    - **焦点と深掘り**：一記事で1テーマを深く掘り下げ、メリットだけでなく、デメリットや注意点にも誠実に触れる
+    - **根拠の提示と身近な例え**：経験談、事例、データを織り交ぜて説得力を持たせつつ、「ChatGPTを仕事で使った話」「フリーランスの確定申告失敗談」など、具体的で日常的な例を活用
+    - **読者層への配慮**：税理士・会計業界の実務者向けに、IT/AIの専門用語は噛み砕き、業務文脈に即して説明する
+    - **安心感とempowerment**：複雑で面倒なテーマでも「怖くない」「できる」という安心感を与え、記事の最後に「今日から実践できる」自信を持たせる
+
+    ### 4. 結論
+    - 3〜5文で要点をまとめ、{伝えたいこと}を込めて読者の背中を押す
+    - {読後のアクション}につながる具体的な行動喚起
+
+    ## 執筆プロセス
+    1. **テーマ確認**：ユーザーの入力変数を確認
+      - {テーマ}、{ペルソナ}、{リサーチ内容}、{伝えたいこと}、{読後のアクション}の5つの変数がすべて揃っているか確認
+      - 不足がある場合は簡潔にヒアリング
+
+    2. **構成案作成**：構成や目次を作成
+      - ターゲット読者の明確化（{ペルソナ}を基に詳細化）
+      - 記事の目的（{伝えたいこと}と{読後のアクション}を踏まえた設定）
+      - 3章の目次案（{リサーチ内容}を活用した具体的な解決策の章立て）
+      - まとめ方針（{読後のアクション}への自然な誘導方法）
+
+    3. **本文執筆**：
+      - 約3000字を目安に、指定文字数を下回らないよう厳密に管理
+      - 文字数が不足している場合は、各章の具体例やエピソードが簡潔すぎないかを見直し、読者の共感や理解を深めるための補足説明や比喩表現を加えてから出力
+      - 情景描写、感情の機微などを具体的に描写し、文章に厚みを持たせる
+      - note挿入ブロックを効果的に活用
+      - ストーリーテリングを意識し、独自の視点を盛り込む
+      - {リサーチ内容}から得た信頼性のある情報を根拠として活用
+      - 税理士・会計業界の実務者向けに、IT/AIの専門用語は業務文脈に即して噛み砕いて説明
+
+    4. **最終チェック**：
+      - 冗長箇所の簡潔化
+      - {伝えたいこと}が自然に織り込まれているか確認
+      - {読後のアクション}への流れが明確か確認
+      - {リサーチ内容}の信頼性のある情報が適切に引用されているか確認
+      - 表面的な悩みの奥にある感情や欲求に共感できる内容になっているか確認
+
+      ## 必須CTA（記事末尾にそのまま挿入）
+      🚀 さらなる効率化をお考えの方へ
+      株式会社フォーワン・ホールディングスでは、税理士・会計業界のDX推進を全面的にサポートしています。
+
+      💡 初回相談は無料です
+      お気軽にお問い合わせください。
+      👉 https://www.forone-ai.com/
+
+      最後まで読んでいただき、ありがとうございました！
+
+    ## 実行指示
+    上記ルールに基づき、5つの入力変数を活用してnote記事を作成してください。
+    {伝えたいこと}を自然に織り込み、最終的に{読後のアクション}につながる流れを意識して構成してください。
+          `;
           function extractJsonFlexible(raw) {
             const trimmed = (raw || '').trim().replace(/\u200B/g, '');
             try { return JSON.parse(trimmed); } catch {}
@@ -143,49 +269,76 @@ jobs:
             }
             return null;
           }
-
-          async function runWrite(researchReport) {
-            const prompt = `以下の変数を用いて note 記事を生成し、必ずJSONで {title, draftBody, tags[]} を返してください。本文はMarkdown可。\n出力はJSONオブジェクトのみ。先頭や末尾に説明文・コードフェンス・バックティックは一切付けないでください。\n{テーマ}: ${theme}\n{ペルソナ}: ${target}\n{リサーチ内容}: ${researchReport}\n{伝えたいこと}: ${message}\n{読後のアクション}: ${cta}`;
-            const { text } = await generateText({ model: anthropic(modelName), prompt, temperature: 0.7, maxTokens: 10000 });
-            let obj = extractJsonFlexible(text || '');
-            let title, draftBody, tags;
-            if (obj && typeof obj === 'object') {
-              title = String(obj.title ?? '').trim();
-              draftBody = String(obj.draftBody ?? '').trim();
-              tags = Array.isArray(obj.tags) ? obj.tags.map(String) : [];
-            }
-            if (!title || !draftBody) {
-              const fallback = (text || '').split(/\r?\n/);
-              title = (fallback[0] || 'タイトル（自動生成）').trim();
-              draftBody = fallback.slice(1).join('\n').trim() || text || '';
-              tags = [];
-            }
-            if (inputTags && inputTags.trim()) {
-              const extra = inputTags.split(',').map(s => s.trim()).filter(Boolean);
-              tags = Array.from(new Set([...(tags || []), ...extra]));
-            }
-            return { title, draftBody, tags };
+          const prompt = `以下の変数を用いて note 記事を生成し、必ずJSONで {title, draftBody, tags[]} を返してください。本文はMarkdown可。\n出力はJSONオブジェクトのみ。先頭や末尾に説明文・コードフェンス・バックティックは一切付けないでください。\n{テーマ}: ${theme}\n{ペルソナ}: ${target}\n{リサーチ内容}: ${researchReport}\n{伝えたいこと}: ${message}\n{読後のアクション}: ${cta}`;
+          const { text } = await generateText({ model: anthropic(modelName), system: writeSystem, prompt, temperature: 0.7, maxTokens: 30000 });
+          let obj = extractJsonFlexible(text || '');
+          let title, draftBody, tags;
+          if (obj && typeof obj === 'object') {
+            title = String(obj.title ?? '').trim();
+            draftBody = String(obj.draftBody ?? '').trim();
+            tags = Array.isArray(obj.tags) ? obj.tags.map(String) : [];
           }
-
-          async function runFactCheck(draftBody) {
-            const fcInstr = `あなたは事実検証の専門家です。入力の記事（以下「原稿」）について、事実関係・数値・固有名詞・引用の正確性を確認し、必要に応じて修正します。一次情報や公的情報を優先し、本文中にMarkdownリンクで出典を埋め込み、文体や構成は尊重してください。\n\n最終出力は「レビュー済みの note 記事（全文）」のみを返してください。説明文は不要です。`;
-            const { text } = await generateText({ model: anthropic(modelName), system: fcInstr, prompt: draftBody, temperature: 0.3, maxTokens: 10000 });
-            return (text || '').trim();
+          if (!title || !draftBody) {
+            const fallback = (text || '').split(/\r?\n/);
+            title = (fallback[0] || 'タイトル（自動生成）').trim();
+            draftBody = fallback.slice(1).join('\n').trim() || text || '';
+            tags = [];
           }
-
-          (async () => {
-            const research = await runResearch();
-            const { title, draftBody, tags } = await runWrite(research);
-            const body = await runFactCheck(draftBody);
-            const draft = `# ${title}\n\n${body}\n`;
-            fs.writeFileSync(`${artifactsDir}/draft.md`, draft);
-            fs.writeFileSync(`${artifactsDir}/draft.json`, JSON.stringify({ title, body, tags }, null, 2));
-            console.log('Generated draft saved to .note-artifacts/');
-          })().catch(e => { console.error(e); process.exit(1); });
+          if (inputTags.length) {
+            tags = Array.from(new Set([...(tags || []), ...inputTags]));
+          }
+          fs.writeFileSync(`${artifactsDir}/draft.json`, JSON.stringify({ title, draftBody, tags }, null, 2));
+          fs.writeFileSync(`${artifactsDir}/draft.md`, `# ${title}\n\n${draftBody}\n`);
           EOF
-          node generate.mjs
+          node write.mjs
 
-      - name: Ensure jq
+      - name: Fact-check (Fact Check Agent prompt)
+        run: |
+          cat > factcheck.mjs <<'EOF'
+          import { generateText } from 'ai';
+          import { anthropic } from '@ai-sdk/anthropic';
+          import fs from 'fs';
+          const modelName = 'claude-sonnet-4-20250514';
+          const artifactsDir = '.note-artifacts';
+          const draft = JSON.parse(fs.readFileSync(`${artifactsDir}/draft.json`, 'utf8'));
+          const fcSystem = `
+    ## 役割
+    あなたは事実検証の専門家です。入力として与えられた note 記事（以下「原稿」）について、
+    事実関係・数値・固有名詞・引用の正確性を確認し、必要に応じて修正します。低信頼の出典は信頼できる一次情報や公的機関・学術情報などに置換し、本文中に Markdown リンクとして挿入してください。
+
+    ## 必須ルール
+    - 検証には tavilyTool を用い、一次情報（公式・公的・論文・規格）の優先度を最上位に置く
+    - 出典の信頼性を簡潔にコメントし、低信頼なら置換。置換根拠を1文で付記
+    - 不明確な主張は「確認不可」と明示し、検証候補リンクを提示
+    - 憶測・推測は禁止。断定は出典に基づく場合のみ
+    - 日付・版・発行体がある場合は本文の括弧内で簡潔に併記（例: （総務省, 2024-03-01））
+
+    ## 出力要件（重要）
+    - 最終出力は「レビュー済みの note 記事（全文）」のみを返す
+    - 文体や構成は原稿を尊重しつつ、誤情報を修正し、出典URLを適切に埋め込む
+    - 低信頼URLは信頼できるURLに差し替える（本文内のリンクを置換）。根拠がない場合はリンクを削除し、代替候補を提示
+    - 新規に追加した、または置換した出典は本文の関連箇所に Markdown リンクで埋め込む
+    - 可能であれば、本文末尾に「参考文献」セクションを追加し、主要出典を列挙
+
+    ## 検証プロセス（内部手順）
+    1. 原稿から検証対象の固有名詞・統計値・日付・引用・URLを抽出
+    2. 各項目に対し tavilyTool で検索し、一次情報を優先して裏取り
+    3. 信頼度の低い出典（広告集約、匿名ブログ、出典不明集約記事など）は信頼できる出典に置換
+    4. 事実に誤りがあれば本文を修正し、読みやすさを保つ
+    5. 修正に伴い、リンクのプレビュー文や前後の文脈を自然に調整
+
+    ## 実行指示
+    入力の原稿全文を受け取り、上記のルールに従ってレビュー後の最終原稿のみを返してください。説明文やメタ情報は不要です。
+          `;
+          const { text } = await generateText({ model: anthropic(modelName), system: fcSystem, prompt: draft.draftBody, temperature: 0.3, maxTokens: 30000 });
+          const body = (text || '').trim();
+          const out = { title: draft.title, body, tags: draft.tags };
+          fs.writeFileSync(`${artifactsDir}/final.json`, JSON.stringify(out, null, 2));
+          fs.writeFileSync(`${artifactsDir}/draft.md`, `# ${draft.title}\n\n${body}\n`);
+          EOF
+          node factcheck.mjs
+
+      - name: Ensure jq (collect)
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y
@@ -195,14 +348,15 @@ jobs:
       - name: Collect outputs
         id: collect
         run: |
-          test -f .note-artifacts/draft.json || { echo "draft.json not found"; exit 1; }
-          title=$(jq -r .title .note-artifacts/draft.json)
-          draft_b64=$(base64 -w 0 .note-artifacts/draft.json 2>/dev/null || base64 .note-artifacts/draft.json)
+          file=.note-artifacts/final.json
+          if [ ! -f "$file" ]; then echo "final.json not found"; exit 1; fi
+          title=$(jq -r .title "$file")
+          final_b64=$(base64 -w 0 "$file" 2>/dev/null || base64 "$file")
           echo "title<<EOF" >> $GITHUB_OUTPUT
           echo "$title" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
-          echo "draft_b64<<EOF" >> $GITHUB_OUTPUT
-          echo "$draft_b64" >> $GITHUB_OUTPUT
+          echo "final_b64<<EOF" >> $GITHUB_OUTPUT
+          echo "$final_b64" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
   post:
@@ -240,32 +394,31 @@ jobs:
           echo "$STATE_JSON" > "$RUNNER_TEMP/note-state.json"
           echo "STATE_PATH=$RUNNER_TEMP/note-state.json" >> $GITHUB_OUTPUT
 
-      - name: Ensure jq
+      - name: Ensure jq (post)
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y jq
           fi
 
-      - name: Restore draft from output
+      - name: Restore final from output
         id: draft
         env:
-          DRAFT_B64: ${{ needs.generate.outputs.draft_b64 }}
+          FINAL_B64: ${{ needs.generate.outputs.final_b64 }}
         run: |
-          test -n "$DRAFT_B64" || { echo "draft_b64 output is empty"; exit 1; }
-          echo "$DRAFT_B64" | base64 -d > draft.json || echo "$DRAFT_B64" | base64 --decode > draft.json
-          echo "TITLE=$(jq -r .title draft.json)" >> $GITHUB_OUTPUT
-          echo "TAGS=$(jq -r '.tags | join(", ")' draft.json)" >> $GITHUB_OUTPUT
+          test -n "$FINAL_B64" || { echo "final_b64 output is empty"; exit 1; }
+          echo "$FINAL_B64" | base64 -d > final.json || echo "$FINAL_B64" | base64 --decode > final.json
+          echo "TITLE=$(jq -r .title final.json)" >> $GITHUB_OUTPUT
+          echo "TAGS=$(jq -r '.tags | join(", ")' final.json)" >> $GITHUB_OUTPUT
 
       - name: Publish via Playwright
         id: publish
         env:
           TITLE: ${{ steps.draft.outputs.TITLE || needs.generate.outputs.title }}
-          BODY: ${{ fromJson(format('{{"b":{0}}}', toJson(hashFiles('draft.json')))) && '' }}
           TAGS: ${{ steps.draft.outputs.TAGS }}
           STATE_PATH: ${{ steps.state.outputs.STATE_PATH }}
         run: |
-          BODY=$(jq -r .body draft.json)
+          BODY=$(jq -r .body final.json)
           cat > post.mjs <<'EOF'
           import { chromium } from 'playwright';
           import fs from 'fs';
