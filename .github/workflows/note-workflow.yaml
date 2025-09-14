@@ -418,7 +418,7 @@ jobs:
           TAGS: ${{ steps.draft.outputs.TAGS }}
           STATE_PATH: ${{ steps.state.outputs.STATE_PATH }}
         run: |
-          BODY=$(jq -r .body final.json)
+          jq -r .body final.json > body.txt
           cat > post.mjs <<'EOF'
           import { chromium } from 'playwright';
           import fs from 'fs';
@@ -434,7 +434,7 @@ jobs:
           const STATE_PATH = process.env.STATE_PATH;
           const START_URL = process.env.START_URL || 'https://editor.note.com/new';
           const TITLE = process.env.TITLE || '';
-          const BODY = process.env.BODY || '';
+          const BODY = fs.readFileSync('body.txt', 'utf8');
           const TAGS = process.env.TAGS || '';
           const IS_PUBLIC = String(process.env.IS_PUBLIC || 'true') === 'true';
 
