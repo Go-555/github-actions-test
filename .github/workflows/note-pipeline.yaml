@@ -349,6 +349,13 @@ jobs:
           echo "$STATE_JSON" > "$RUNNER_TEMP/note-state.json"
           echo "STATE_PATH=$RUNNER_TEMP/note-state.json" >> $GITHUB_OUTPUT
 
+      - name: Ensure jq (post)
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
       - name: Restore final
         id: draft
         env:
@@ -356,8 +363,8 @@ jobs:
         run: |
           test -n "$FINAL_B64" || { echo "final_b64 output is empty"; exit 1; }
           echo "$FINAL_B64" | base64 -d > final.json || echo "$FINAL_B64" | base64 --decode > final.json
-          echo "TITLE=$(node -e \"console.log(JSON.parse(require('fs').readFileSync('final.json','utf8')).title)\")" >> $GITHUB_OUTPUT
-          echo "TAGS=$(node -e \"console.log((JSON.parse(require('fs').readFileSync('final.json','utf8')).tags||[]).join(', '))\")" >> $GITHUB_OUTPUT
+          echo "TITLE=$(jq -r .title final.json)" >> $GITHUB_OUTPUT
+          echo "TAGS=$(jq -r '.tags | join(", ")' final.json)" >> $GITHUB_OUTPUT
 
       - name: Publish via Playwright (draft or public)
         id: publish
