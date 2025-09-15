@@ -499,6 +499,33 @@ jobs:
               }catch{return `${text} ${url}`;}
             });
           }
+          function isGarbageLine(line){
+            return /^[\s\{\}\[\]\(\)`]+$/.test(line || '');
+          }
+          function normalizeListItemSoftBreaks(md){
+            const lines=String(md||'').split(/\r?\n/);
+            const out=[]; let inItem=false;
+            const listStartRe=/^(\s*)(?:[-*+]\s|\d+\.\s)/;
+            for (let i=0;i<lines.length;i++){
+              const line=lines[i];
+              if (listStartRe.test(line)){
+                inItem=true;
+                out.push(line.replace(/\s+$/,''));
+                continue;
+              }
+              if (inItem){
+                // 空行 or 次のリスト開始でアイテム終端
+                if (!line.trim()) { out.push(line); inItem=false; continue; }
+                if (listStartRe.test(line)) { inItem=false; out.push(line); continue; }
+                // 継続行は1行へ連結
+                const last = out.pop() || '';
+                out.push(last + ' ' + line.trim());
+                continue;
+              }
+              out.push(line);
+            }
+            return out.join('\n');
+          }
           function splitMarkdownBlocks(md){
             const lines=String(md||'').split(/\r?\n/);
             const blocks=[]; let cur=[]; let inFence=false; let fenceTag='';
@@ -508,13 +535,13 @@ jobs:
                 if(!inFence){ inFence=true; fenceTag=m[1]||''; cur.push(line); }
                 else { inFence=false; fenceTag=''; cur.push(line); blocks.push(cur.join('\n')); cur=[]; continue; }
               } else if(!inFence && line.trim()===''){ if(cur.length){ blocks.push(cur.join('\n')); cur=[]; continue; } }
+              else if(!inFence && isGarbageLine(line)) { continue; }
               cur.push(line);
             }
             if(cur.length) blocks.push(cur.join('\n'));
-            return blocks.filter(b=>b.trim().length>0);
+            return blocks.filter(b=>{ const t=b.trim(); return t.length>0 && !isGarbageLine(t); });
           }
           function mdToHtml(block){
-            marked.setOptions({ gfm:true, breaks:true, mangle:false, headerIds:false });
             // JSONが紛れ込んでしまった場合は本文候補のみ抽出
             try{
               const maybe = JSON.parse(block);
@@ -524,8 +551,8 @@ jobs:
                 if (chosen) block = String(chosen);
               }
             }catch{}
-            const html = marked.parse(block);
-            return String(html||'');
+            const isList = /^\s*(?:[-*+]\s|\d+\.\s)/.test(block);
+            return String(marked.parse(block, { gfm:true, breaks: !isList, mangle:false, headerIds:false }) || '');
           }
           async function insertHTML(page, locator, html){
             await locator.click();
@@ -544,6 +571,7 @@ jobs:
           let TITLE=sanitizeTitle(rawTitle);
           let preBody = preferBareUrls(rawBody);
           preBody = normalizeBullets(preBody);
+          preBody = normalizeListItemSoftBreaks(preBody);
           preBody = unwrapParagraphs(preBody);
           if(!TITLE || TITLE==='タイトル（自動生成）'){
             const d=deriveTitleFromMarkdown(preBody);
