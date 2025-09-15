@@ -255,7 +255,22 @@ jobs:
           const TAVILY_API_KEY=process.env.TAVILY_API_KEY||'';
           if(!TAVILY_API_KEY){ console.error('TAVILY_API_KEY is not set'); process.exit(1); }
 
-          function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/\u200B/g,'');try{return JSON.parse(t);}catch{}const m=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(m&&m[1]){try{return JSON.parse(m[1].trim());}catch{}}const f=t.indexOf('['),l=t.lastIndexOf(']');if(f!==-1&&l!==-1&&l>f){const c=t.slice(f,l+1);try{return JSON.parse(c);}catch{}}return null;}
+          function extractJsonFlexible(raw){
+            const t=(raw||'').trim().replace(/\u200B/g,'');
+            // try object
+            try{ const o=JSON.parse(t); return o; }catch{}
+            const fence=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/); if(fence&&fence[1]){ try{ return JSON.parse(fence[1].trim()); }catch{} }
+            // try object slice
+            let f=t.indexOf('{'), l=t.lastIndexOf('}'); if(f!==-1&&l!==-1&&l>f){ const cand=t.slice(f,l+1); try{ return JSON.parse(cand); }catch{} }
+            // try array slice
+            f=t.indexOf('['); l=t.lastIndexOf(']'); if(f!==-1&&l!==-1&&l>f){ const cand=t.slice(f,l+1); try{ return JSON.parse(cand); }catch{} }
+            return null;
+          }
+          function stripCodeFence(s){
+            const t=String(s||'').trim();
+            const m=t.match(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```\s*$/); if(m&&m[1]) return m[1].trim();
+            return t;
+          }
 
           async function proposeQueries(body){
             const sys='あなたは事実検証の専門家です。入力本文から検証が必要な固有名詞・数値・主張を抽出し、Tavily検索用に日本語の検索クエリを最大10件の配列で返してください。出力はJSON配列のみ。';
@@ -304,8 +319,19 @@ jobs:
               '## 原稿', String(draft.draftBody||''), '', '## エビデンス（Tavily検索結果）', evidence
             ].join('\n\n');
             const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature: 0.3, maxTokens: 30000 });
-            const body = (text||'').trim();
-            const out = { title: process.env.TITLE || draft.title || '', body, tags: draft.tags || [] };
+            let body = stripCodeFence(text||'');
+            let title = process.env.TITLE || draft.title || '';
+            let tags = Array.isArray(draft.tags)? draft.tags: [];
+            const obj = extractJsonFlexible(body);
+            if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+              if (obj.title) title = String(obj.title);
+              const candidates = [obj.body, obj.draftBody, obj.content, obj.text];
+              const chosen = candidates.find(v=>typeof v==='string' && v.trim());
+              if (chosen) body = String(chosen);
+              if (Array.isArray(obj.tags)) tags = obj.tags.map(String);
+            }
+            body = stripCodeFence(body);
+            const out = { title, body, tags };
             fs.writeFileSync('.note-artifacts/final.json', JSON.stringify(out,null,2));
           }
 
@@ -447,6 +473,15 @@ jobs:
           }
           function mdToHtml(block){
             marked.setOptions({ gfm:true, breaks:true, mangle:false, headerIds:false });
+            // JSONが紛れ込んでしまった場合は本文候補のみ抽出
+            try{
+              const maybe = JSON.parse(block);
+              if (maybe && typeof maybe==='object' && !Array.isArray(maybe)){
+                const candidates=[maybe.body, maybe.draftBody, maybe.content, maybe.text];
+                const chosen=candidates.find(v=>typeof v==='string' && v.trim());
+                if (chosen) block = String(chosen);
+              }
+            }catch{}
             const html = marked.parse(block);
             return String(html||'');
           }
