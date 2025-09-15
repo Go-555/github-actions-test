@@ -78,6 +78,7 @@ jobs:
           import fs from 'fs';
           const theme = process.env.THEME || '';
           const target = process.env.TARGET || '';
+          const today = new Date().toISOString().slice(0,10);
           const artifactsDir = '.note-artifacts';
           fs.mkdirSync(artifactsDir, { recursive: true });
           const sys = [
@@ -86,7 +87,7 @@ jobs:
             '十分な分量（目安: 1,200語以上）。各節で出典を本文に埋め込む。',
             'WebSearch と WebFetch を必ず使用し、一次情報（公的機関・規格・論文・公式）を優先する。',
           ].join('\n');
-          const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
+          const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}\n現在日付: ${today}`;
           const messages = [];
           for await (const msg of query({
             prompt: userPrompt,
@@ -473,13 +474,15 @@ jobs:
               const line=raw.replace(/\u200B/g,'');
               if(/^```/.test(line)){ inFence=!inFence; buf+=line+'\n'; continue; }
               if(inFence){ buf+=line+'\n'; continue; }
-              if(/^\s*$/.test(line)){ out.push(buf.trim()); out.push(''); buf=''; continue; }
+              if(/^\s*$/.test(line)){ if(buf) out.push(buf.trim()); out.push(''); buf=''; continue; }
+              // 箇条書きや番号付きの字下げ改行を一行に連結
               if(/^(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(line)){
                 if(buf){ out.push(buf.trim()); buf=''; }
-                out.push(line);
+                // 次の数行が連続して単語単位の改行の場合は連結
+                out.push(line.replace(/\s+$/,''));
                 continue;
               }
-              // 行末が句点等で終わらない場合は次行へ連結
+              // 行頭が1文字や数文字で改行されているケース（縦伸び）を連結
               if(buf){ buf += (/[。.!?)]$/.test(buf) ? '\n' : ' ') + line.trim(); }
               else { buf = line.trim(); }
             }
