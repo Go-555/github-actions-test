@@ -388,8 +388,10 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       THEME: ${{ github.event.inputs.theme }}
       TARGET: ${{ github.event.inputs.target }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
     outputs:
       research_b64: ${{ steps.collect.outputs.research_b64 }}
+      metrics_b64: ${{ steps.metrics.outputs.metrics_b64 }}
     steps:
       - name: Checkout (self)
         uses: actions/checkout@v4
@@ -416,6 +418,8 @@ jobs:
           const sys = [
             'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
             '事実ベース・一次情報優先・本文内にMarkdownリンクで出典を埋め込むこと。',
+            '十分な分量（目安: 1,200語以上）。各節で出典を本文に埋め込む。',
+            'WebSearch と WebFetch を必ず使用し、一次情報（公的機関・規格・論文・公式）を優先する。',
           ].join('\n');
           const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}`;
           const messages = [];
@@ -431,8 +435,44 @@ jobs:
             const c=m.message?.content; if(Array.isArray(c)){return c.filter(b=>b?.type==='text').map(b=>b.text).join('\n');} return '';
           }).filter(Boolean).join('\n\n');
           fs.writeFileSync(`${artifactsDir}/research.md`, assistantTexts || '');
+          // Save raw trace for diagnostics (to count tool usage etc.)
+          try { fs.writeFileSync(`${artifactsDir}/research_trace.json`, JSON.stringify(messages, null, 2)); } catch {}
           EOF
           node research.mjs
+
+      - name: Analyze research metrics
+        id: metrics
+        run: |
+          cat > analyze.mjs <<'EOF'
+          import fs from 'fs';
+          function toHost(u){ try { return new URL(u).hostname.replace(/^www\./,''); } catch { return null; } }
+          const body = fs.existsSync('.note-artifacts/research.md') ? fs.readFileSync('.note-artifacts/research.md','utf8') : '';
+          const trace = fs.existsSync('.note-artifacts/research_trace.json') ? JSON.parse(fs.readFileSync('.note-artifacts/research_trace.json','utf8')) : [];
+          const linkRegex = /https?:\/\/[^\s)\]]+/g;
+          const links = Array.from(new Set((body.match(linkRegex) || []).map(s=>s.trim())));
+          const mdLinks = Array.from(body.matchAll(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g)).map(m=>({text:m[1],url:m[2]}));
+          const domains = Array.from(new Set(links.map(toHost).filter(Boolean)));
+          const words = body.trim() ? body.trim().split(/\s+/).filter(Boolean).length : 0;
+          const chars = body.length;
+          const quotes = (body.match(/^>\s+/gm) || []).length;
+          const jsonStr = JSON.stringify(trace);
+          const webSearchCalls = (jsonStr.match(/WebSearch/gi) || []).length;
+          const webFetchCalls = (jsonStr.match(/WebFetch/gi) || []).length;
+          const meta = { words, chars, quoteBlocks: quotes, linkCount: links.length, mdLinkCount: mdLinks.length, uniqueDomains: domains.length, domains, webSearchCalls, webFetchCalls };
+          fs.writeFileSync('.note-artifacts/research_meta.json', JSON.stringify(meta, null, 2));
+          console.log('RESEARCH_META_JSON=' + JSON.stringify(meta));
+          EOF
+          node analyze.mjs
+          echo "metrics_b64<<EOF" >> $GITHUB_OUTPUT
+          base64 -w 0 .note-artifacts/research_meta.json 2>/dev/null || base64 .note-artifacts/research_meta.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "## Research metrics";
+            echo;
+            echo '```json';
+            cat .note-artifacts/research_meta.json;
+            echo '```';
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Collect research
         id: collect
@@ -441,6 +481,15 @@ jobs:
           echo "research_b64<<EOF" >> $GITHUB_OUTPUT
           echo "$b64" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload research artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-artifacts
+          path: |
+            .note-artifacts/research.md
+            .note-artifacts/research_meta.json
+            .note-artifacts/research_trace.json
 
   write:
     name: Write (JSON title/body/tags)
@@ -517,6 +566,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       TITLE: ${{ needs.write.outputs.title }}
     outputs:
       title: ${{ steps.collect.outputs.title }}
@@ -530,10 +580,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install deps (AI SDK)
+      - name: Install deps (CCSDK + AI SDK)
         run: |
           npm init -y
-          npm i ai @ai-sdk/anthropic
+          npm i ai @ai-sdk/anthropic @anthropic-ai/claude-code
 
       - name: Restore draft json
         env:
@@ -542,21 +592,47 @@ jobs:
           mkdir -p .note-artifacts
           echo "$DRAFT_JSON_B64" | base64 -d > .note-artifacts/draft.json || echo "$DRAFT_JSON_B64" | base64 --decode > .note-artifacts/draft.json
 
-      - name: Fact-check generate
+      - name: Fact-check generate (with Web tools)
         run: |
           cat > factcheck.mjs <<'EOF'
+          import { query } from '@anthropic-ai/claude-code';
           import { generateText } from 'ai';
           import { anthropic } from '@ai-sdk/anthropic';
           import fs from 'fs';
           const modelName='claude-sonnet-4-20250514';
           const draft=JSON.parse(fs.readFileSync('.note-artifacts/draft.json','utf8'));
-          const fcSystem='事実検証を行い、本文を修正して全文を返す。本文内に信頼できる出典をMarkdownリンクで埋め込む。出力は最終本文のみ。';
-          const {text}=await generateText({model:anthropic(modelName),system:fcSystem,prompt:String(draft.draftBody||''),temperature:0.3,maxTokens:30000});
-          const body=(text||'').trim();
+          // まず CCSDK でブラウジングしながら検証ポイントを抽出
+          const sys=[
+            'あなたは事実検証の専門家です。低信頼の出典は公的・学術・公式の一次情報に置換します。',
+            '本文の主張・数値・固有名詞・日付を抽出し、WebSearch/WebFetchで一次情報の裏取りを行い、本文にMarkdownリンクで埋め込み直してください。',
+            '出力は修正済みの本文のみ。',
+          ].join('\n');
+          const messages=[];
+          for await (const msg of query({
+            prompt: String(draft.draftBody||''),
+            options: {
+              customSystemPrompt: sys,
+              allowedTools: ['WebSearch','WebFetch'],
+              permissionMode: 'acceptEdits',
+            },
+          })) { messages.push(msg); }
+          const assistantTexts = messages.filter(m=>m.type==='assistant').map(m=>{
+            const c=m.message?.content; if(Array.isArray(c)){return c.filter(b=>b?.type==='text').map(b=>b.text).join('\n');} return '';
+          }).filter(Boolean).join('\n\n');
+          const body = assistantTexts && assistantTexts.trim() ? assistantTexts.trim() : String(draft.draftBody||'');
+          try { fs.writeFileSync('.note-artifacts/factcheck_trace.json', JSON.stringify(messages,null,2)); } catch {}
           const out={title: process.env.TITLE || draft.title, body, tags: draft.tags||[]};
           fs.writeFileSync('.note-artifacts/final.json',JSON.stringify(out,null,2));
           EOF
           node factcheck.mjs
+
+      - name: Upload fact-check artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: factcheck-artifacts
+          path: |
+            .note-artifacts/final.json
+            .note-artifacts/factcheck_trace.json
 
       - name: Collect final
         id: collect
