@@ -444,8 +444,47 @@ jobs:
             s=s.replace(/^"+|"+$/g,'').replace(/^'+|'+$/g,'');
             s=s.replace(/^`+|`+$/g,'');
             s=s.replace(/^json$/i,'').trim();
+            // タイトルが波括弧や記号のみの時は無効として扱う
+            if (/^[\{\}\[\]\(\)\s]*$/.test(s)) s='';
             if(!s) s='タイトル（自動生成）';
             return s;
+          }
+          function deriveTitleFromMarkdown(md){
+            const lines=String(md||'').split(/\r?\n/);
+            for (const line of lines){
+              const l=line.trim();
+              if(!l) continue;
+              const m=l.match(/^#{1,3}\s+(.+)/); if(m) return sanitizeTitle(m[1]);
+              if(!/^```|^>|^\* |^- |^\d+\. /.test(l)) return sanitizeTitle(l);
+            }
+            return '';
+          }
+          function normalizeBullets(md){
+            // 先頭の中黒・ビュレットを箇条書きに正規化
+            return String(md||'')
+              .replace(/^\s*[•・]\s?/gm,'- ')
+              .replace(/^\s*◦\s?/gm,'  - ');
+          }
+          function unwrapParagraphs(md){
+            // 段落中の不必要な改行をスペースへ（見出し/リスト/引用/コードは除外）
+            const lines=String(md||'').split(/\r?\n/);
+            const out=[]; let buf=''; let inFence=false;
+            for(const raw of lines){
+              const line=raw.replace(/\u200B/g,'');
+              if(/^```/.test(line)){ inFence=!inFence; buf+=line+'\n'; continue; }
+              if(inFence){ buf+=line+'\n'; continue; }
+              if(/^\s*$/.test(line)){ out.push(buf.trim()); out.push(''); buf=''; continue; }
+              if(/^(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(line)){
+                if(buf){ out.push(buf.trim()); buf=''; }
+                out.push(line);
+                continue;
+              }
+              // 行末が句点等で終わらない場合は次行へ連結
+              if(buf){ buf += (/[。.!?)]$/.test(buf) ? '\n' : ' ') + line.trim(); }
+              else { buf = line.trim(); }
+            }
+            if(buf) out.push(buf.trim());
+            return out.join('\n');
           }
           function preferBareUrls(md){
             const embedDomains=['openai.com','youtube.com','youtu.be','x.com','twitter.com','speakerdeck.com','slideshare.net','google.com','maps.app.goo.gl','gist.github.com'];
@@ -499,8 +538,14 @@ jobs:
             }, html);
           }
 
-          const TITLE=sanitizeTitle(rawTitle);
-          const preBody = preferBareUrls(rawBody);
+          let TITLE=sanitizeTitle(rawTitle);
+          let preBody = preferBareUrls(rawBody);
+          preBody = normalizeBullets(preBody);
+          preBody = unwrapParagraphs(preBody);
+          if(!TITLE || TITLE==='タイトル（自動生成）'){
+            const d=deriveTitleFromMarkdown(preBody);
+            if(d) TITLE=d;
+          }
           const blocks = splitMarkdownBlocks(preBody);
 
           let browser, context, page;
