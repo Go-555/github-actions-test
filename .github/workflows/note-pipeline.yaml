@@ -354,7 +354,7 @@ jobs:
       - name: Install Playwright
         run: |
           npm init -y
-          npm i playwright
+          npm i playwright marked
           npx playwright install --with-deps chromium | cat
 
       - name: Prepare storageState
@@ -392,6 +392,7 @@ jobs:
           # 本文は後続スクリプト内でMarkdownリンク→素URL化などの前処理を行う
           cat > post.mjs <<'EOF'
           import { chromium } from 'playwright';
+          import { marked } from 'marked';
           import fs from 'fs';
           import os from 'os';
           import path from 'path';
@@ -420,29 +421,52 @@ jobs:
             if(!s) s='タイトル（自動生成）';
             return s;
           }
-          function mdLinksToBareUrls(md){
+          function preferBareUrls(md){
+            const embedDomains=['openai.com','youtube.com','youtu.be','x.com','twitter.com','speakerdeck.com','slideshare.net','google.com','maps.app.goo.gl','gist.github.com'];
             return String(md||'').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,(m,text,url)=>{
-              // 末尾の句読点がURLに混ざっている場合は外す
-              const cleaned=url.replace(/[)\]\.,;:」』】＞)>]+$/u,'');
-              return `${text} ${cleaned}`;
+              try{
+                const u=new URL(url); const host=u.hostname.replace(/^www\./,'');
+                const isEmbed = embedDomains.some(d=>host.endsWith(d) || (url.includes('google.com/maps') && d.includes('google.com')));
+                return isEmbed ? `${text}\n${url}\n` : `${text} (${url})`;
+              }catch{return `${text} ${url}`;}
             });
           }
-          function normalizeBody(md){
-            let s=md.replace(/\u200B/g,'');
-            s=mdLinksToBareUrls(s);
-            return s;
-          }
-          async function insertLargeText(page, locator, text){
-            const chunks = text.match(/[\s\S]{1,5000}/g) || [];
-            await locator.click();
-            for (const chunk of chunks){
-              await page.keyboard.insertText(chunk);
-              await page.waitForTimeout(10);
+          function splitMarkdownBlocks(md){
+            const lines=String(md||'').split(/\r?\n/);
+            const blocks=[]; let cur=[]; let inFence=false; let fenceTag='';
+            for(const line of lines){
+              const m=line.match(/^```(.*)$/);
+              if(m){
+                if(!inFence){ inFence=true; fenceTag=m[1]||''; cur.push(line); }
+                else { inFence=false; fenceTag=''; cur.push(line); blocks.push(cur.join('\n')); cur=[]; continue; }
+              } else if(!inFence && line.trim()===''){ if(cur.length){ blocks.push(cur.join('\n')); cur=[]; continue; } }
+              cur.push(line);
             }
+            if(cur.length) blocks.push(cur.join('\n'));
+            return blocks.filter(b=>b.trim().length>0);
+          }
+          function mdToHtml(block){
+            marked.setOptions({ gfm:true, breaks:true, mangle:false, headerIds:false });
+            const html = marked.parse(block);
+            return String(html||'');
+          }
+          async function insertHTML(page, locator, html){
+            await locator.click();
+            await locator.evaluate((el, html) => {
+              el.focus();
+              const sel = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              range.collapse(false);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand('insertHTML', false, html);
+            }, html);
           }
 
           const TITLE=sanitizeTitle(rawTitle);
-          const BODY=normalizeBody(rawBody);
+          const preBody = preferBareUrls(rawBody);
+          const blocks = splitMarkdownBlocks(preBody);
 
           let browser, context, page;
           try{
@@ -457,7 +481,12 @@ jobs:
 
             const bodyBox = page.locator('div[contenteditable="true"][role="textbox"]').first();
             await bodyBox.waitFor({ state: 'visible' });
-            await insertLargeText(page, bodyBox, BODY);
+            for(const block of blocks){
+              const html = mdToHtml(block);
+              await insertHTML(page, bodyBox, html);
+              await page.keyboard.press('Enter');
+              await page.waitForTimeout(30);
+            }
 
             if(!IS_PUBLIC){
               const saveBtn = page.locator('button:has-text("下書き保存"), [aria-label*="下書き保存"]').first();
