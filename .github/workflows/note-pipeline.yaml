@@ -84,7 +84,7 @@ jobs:
           const sys = [
             'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
             '事実ベース・一次情報優先・本文内にMarkdownリンクで出典を埋め込むこと。',
-            '十分な分量（目安: 1,200語以上）。各節で出典を本文に埋め込む。',
+            '十分な分量（目安: 2,000語以上）。各節で出典を本文に埋め込む。',
             'WebSearch と WebFetch を必ず使用し、一次情報（公的機関・規格・論文・公式）を優先する。',
           ].join('\n');
           const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}\n現在日付: ${today}`;
@@ -184,7 +184,7 @@ jobs:
             const firstReal=lines.find(l=>!/^```/.test(l))||lines[0]||'';
             return sanitizeTitle(firstReal);
           }
-          const sysWrite='note.com向け長文記事の生成。JSON {title,draftBody,tags[]} で返答。';
+          const sysWrite='note.com向け長文記事の生成。JSON {title,draftBody,tags[]} で返答。draftBodyは6000〜9000文字を目安に十分な分量で、章ごとに小見出しと箇条書きを適切に含めること。';
           const prompt=[`{テーマ}: ${theme}`,`{ペルソナ}: ${target}`,`{リサーチ内容}: ${researchReport}`,`{伝えたいこと}: ${message}`,`{読後のアクション}: ${cta}`].join('\n');
           const {text}=await generateText({model:anthropic(modelName),system:sysWrite,prompt,temperature:0.7,maxTokens:30000});
           let obj=extractJsonFlexible(text||'')||await repairJson(text||'');
@@ -554,6 +554,10 @@ jobs:
             const isList = /^\s*(?:[-*+]\s|\d+\.\s)/.test(block);
             return String(marked.parse(block, { gfm:true, breaks: !isList, mangle:false, headerIds:false }) || '');
           }
+          function htmlFromMarkdown(md){
+            // 全文を一括でHTML化（段落ベース）。リスト中の意図しない <br> を避けるため breaks=false
+            return String(marked.parse(md, { gfm:true, breaks:false, mangle:false, headerIds:false }) || '');
+          }
           async function insertHTML(page, locator, html){
             await locator.click();
             await locator.evaluate((el, html) => {
@@ -592,11 +596,29 @@ jobs:
 
             const bodyBox = page.locator('div[contenteditable="true"][role="textbox"]').first();
             await bodyBox.waitFor({ state: 'visible' });
-            for(const block of blocks){
-              const html = mdToHtml(block);
-              await insertHTML(page, bodyBox, html);
-              await page.keyboard.press('Enter');
-              await page.waitForTimeout(30);
+            const htmlAll = htmlFromMarkdown(preBody);
+            let pasted = false;
+            try {
+              const origin = new URL(START_URL).origin;
+              await context.grantPermissions(['clipboard-read','clipboard-write'], { origin });
+              await page.evaluate(async (html, plain) => {
+                const item = new ClipboardItem({
+                  'text/html': new Blob([html], { type: 'text/html' }),
+                  'text/plain': new Blob([plain], { type: 'text/plain' }),
+                });
+                await navigator.clipboard.write([item]);
+              }, htmlAll, preBody);
+              await bodyBox.click();
+              await page.keyboard.press('Control+V');
+              await page.waitForTimeout(200);
+              pasted = true;
+            } catch (e) {
+              // クリップボード権限が無い場合のフォールバック
+            }
+            if (!pasted) {
+              // 一括HTML挿入フォールバック
+              await insertHTML(page, bodyBox, htmlAll);
+              await page.waitForTimeout(100);
             }
 
             if(!IS_PUBLIC){
