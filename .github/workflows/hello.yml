@@ -1,0 +1,11 @@
+name: Hello Sunshine
+
+on:
+  workflow_dispatch:
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: echo "こんにちは🌞"
